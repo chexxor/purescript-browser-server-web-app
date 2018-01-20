@@ -144,6 +144,7 @@ We call these "dynamic HTML components", because the DOM created by this HTML is
 Notes:
 - An HTML page as a whole entity is not dynamic, but components in its body are. We need to define these two things separately, then, such that a `HTML` is dynamic, not `HTMLPage`, the page in which it's mounted.
 - These elements can become quite complex and managing the complexity can be quite difficult. A helpful tool to mitigate this problem is a type-checker which checks references between HTML and JavaScript. Such a tool is implemented by parsing an `HTML` string or by writing both the HTML and its supporting JavaScript in the same language.
+- There is a variety of ways to make an `HTML` value using PureScript -- VirtualDOM, StaticDOM, Mustache templates -- so we can't presume a certain tool was used to make it.
 
 For the purposes of this project, a client-server HTML rendering system, a dynamic HTML component needs the following attributes:
 - Two rendering targets - an HTML file for a browser-requested page, and a DOM creator/hydrator for an in-browser app patching an existing `HTMLDocument`.
@@ -153,36 +154,109 @@ For the purposes of this project, a client-server HTML rendering system, a dynam
 ``` purescript
 -- A dynamic component needs supporting JavaScript
 newtype JavaScript = JavaScript String
+
+-- ??? How much of these should the client-server HTML rendering platform prescribe?
+-- A dynamic HTML component attaches behavior before mounting at a certain lifecycle point.
+-- Instantiation process:
+--  - if isSSRed target then claim targetNodes else create nodes
+--      "claim" and "create" add listeners and attributes (need to do attributes???)
+--  - detach unneededNodes
+--  - mount nodes on targetNodes
+newtype DynamicHTMLJavaScript = DynamicHTMLJavaScript
+  -- \/ Initialize nodes used in component and keep in component's scope.
+  { create :: JavaScript
+  -- \/ Given children of target node, keep refs matching desired state in component's scope.
+  --      Any unmatched nodes should be detached from DOM.
+  , claim :: JavaScript -- (Array Node) -> Eff _ (Array Node)
+  -- \/ Mount nodes in component's scope to DOM at target node.
+  , mount :: JavaScript
+  -- \/ Attach listeners and perhaps data-dependent attributes.
+  , hydrate :: JavaScript
+  -- \/ Detach component's nodes from DOM, but keeps managed nodes instantiated.
+  , unmount :: JavaScript -- ?? Rename to "destroy"?
+  -- \/ Destroy component's state and scope, remove listeners. Should have already unmounted.
+  , unmount :: JavaScript -- ?? Rename to "destroy"?
+  }
+
 -- Any HTML having hydrating JavaScript is DynamicHTML
 -- DynamicHTML is not composable, it's a box used to move a dynamic HTML component from
 --   server to client and to return a form appropriate to the requestor - either the browser or in-browser app.
 -- ??? It's ok this isn't composable? If composable, how to compose hydration scripts?
-data DynamicHTML a = DynamicHTML HTML JavaScript a
+--data DynamicHTML a = DynamicHTML HTML JavaScript (Maybe a)
+data DynamicHTML a = DynamicHTML HTML DynamicHTMLJavaScript (Maybe a)
 
 -- Anything rendering both HTML and its hydrating JavaScript is a DynamicHTMLProgram
 -- ??? Define elsewhere? Not always puts code in script tag.
 data DynamicHTMLProgram a = DynamicHTMLProgram
-  (a -> HTML) -- renderAsHTMLString
-  (a -> JavaScript) -- renderSupportingJavaScript
-  (forall m. JavaScript -> DOMElement -> m) -- hydrateDOM
+  -- on server
+  { renderAsHTMLString :: (a -> HTML)
+  , renderSupportingJavaScript :: (a -> JavaScript)
+  -- on browser
+  , mount :: (forall m. JavaScript -> DOMElement -> m Unit)
+  , hydrateDOM :: (forall m. JavaScript -> DOMElement -> m Unit)
+  }
 runDynamicHTMLProgram :: DynamicHTMLProgram a -> a -> DynamicHTML
 runDynamicHTMLProgram (DynamicHTMLProgram renderHTML renderJS hydrate) program =
-  DynamicHTML (renderHTML program) (renderJS program)
+  DynamicHTML (renderHTML program) (renderJS program) data
+```
 
--- A example of a `DynamicHTMLProgram` - React
-reactHTMLProgram :: DynamicHTMLProgram ReactComponent
+Let's test this model on a real-world example - a React-managed dynamic HTML element.
+
+``` purescript
+reactHTMLProgram :: DynamicHTMLProgram ReactElement
 reactHTMLProgram = DynamicHTMLProgram
-  (ReactDOMServer.renderToString)
-  (id) -- the whole ReactComponent is the supporting JS
-  (ReactDOM.hydrate)
+  { renderAsHTMLString: ReactDOMServer.renderToString
+  -- \/ the whole ReactComponent is the supporting JS
+  , renderSupportingJavaScript: JavaScript <<< unsafeCoerce
+  , mount: ReactDOM.render
+  , hydrateDOM: ReactDOM.hydrate
+  }
+
+hello :: ReactElement
+hello = D.div' [ D.text "Hello" ]
+
+httpResponse :: DynamicHTML
+httpResponse = runDynamicHTMLProgram reactHTMLProgram hello
+
+handleHTMLRequest :: HTMLRequest -> Eff Unit
+handleHTMLRequest req = respond html
+  where
+    matchedPage :: ReactElement
+    dynHtml :: DynamicHTML
+    dynHtml = runDynamicHTMLProgram reactHTMLProgram hello
+    html :: DynamicHTML -> HTML
+    html (DynamicHTML h js d) =
+      "<html><head></head><body>"
+      <> h
+      <> "<script>"
+      <> js
+      <> "document.onload(function() {"
+      <> js.onload
+      <> "});"
+      <> "</script>"
+      <> "</body></html>"
+
+handleInBrowserHTMLRequest :: HTMLRequest -> HTMLRequestHandler m
+handleInBrowserHTMLRequest req =
+  loadRoute app
+  where
+    routeFromHtmlReq :: HTMLRequest -> Route
+    loadRoute :: Route -> ContT Unit _ DynamicHTML -- in-browser lazy-load this module
+    htmlGen :: DynamicHTML
+
+-- !!! Need JS for create, not only hydrate
+mountInBrowserHTML :: DynamicHTML -> Eff _ Unit
+mountInBrowserHTML (DynamicHTML h js d) = exec js
+  where exec :: JavaScript -> Eff _ Unit
 ```
 
 
 ### Dynamic HTML Components
 
-There is a variety of ways to make an `HTML` value using PureScript -- VirtualDOM, StaticDOM, Mustache templates -- so we can't presume a certain tool was used to make it.
-
 !!! What would `DynamicHTMLComponent` look like? How would that compose?
+??? Concept of DynamicHTMLComponentRoot or DynamicHTMLComponentManager,
+      which is a single component/template and manages its children in a single scope,
+      for efficiency.
 Leave undefined until we attempt a POC of this system.
 
 
