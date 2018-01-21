@@ -156,13 +156,14 @@ For the purposes of this project, a client-server HTML rendering system, a dynam
 newtype JavaScript = JavaScript String
 
 -- ??? How much of these should the client-server HTML rendering platform prescribe?
+-- !!! Move this to be example.
 -- A dynamic HTML component attaches behavior before mounting at a certain lifecycle point.
 -- Instantiation process:
 --  - if isSSRed target then claim targetNodes else create nodes
 --      "claim" and "create" add listeners and attributes (need to do attributes???)
 --  - detach unneededNodes
 --  - mount nodes on targetNodes
-newtype DynamicHTMLJavaScript = DynamicHTMLJavaScript
+newtype DynamicHTMLJavaScriptPRO = DynamicHTMLJavaScriptPRO
   -- \/ Initialize nodes used in component and keep in component's scope.
   { create :: JavaScript
   -- \/ Given children of target node, keep refs matching desired state in component's scope.
@@ -173,9 +174,18 @@ newtype DynamicHTMLJavaScript = DynamicHTMLJavaScript
   -- \/ Attach listeners and perhaps data-dependent attributes.
   , hydrate :: JavaScript
   -- \/ Detach component's nodes from DOM, but keeps managed nodes instantiated.
-  , unmount :: JavaScript -- ?? Rename to "destroy"?
+  , unmount :: JavaScript
   -- \/ Destroy component's state and scope, remove listeners. Should have already unmounted.
-  , unmount :: JavaScript -- ?? Rename to "destroy"?
+  , destroy :: JavaScript
+  }
+
+-- Dynamic HTML component's supporting JS needs to be executed.
+-- The record represents a JavaScript module, which exports an object of named functions.
+-- If manages its own lifecycle itself, such as mount DOM elements,
+--   create in-scope state, or destroy itself.
+-- Will be initialized with w/e data was sent with it from the server.
+type DynamicHTMLJavaScript a =
+  { init :: a -> Eff _ Unit
   }
 
 -- Any HTML having hydrating JavaScript is DynamicHTML
@@ -183,7 +193,7 @@ newtype DynamicHTMLJavaScript = DynamicHTMLJavaScript
 --   server to client and to return a form appropriate to the requestor - either the browser or in-browser app.
 -- ??? It's ok this isn't composable? If composable, how to compose hydration scripts?
 --data DynamicHTML a = DynamicHTML HTML JavaScript (Maybe a)
-data DynamicHTML a = DynamicHTML HTML DynamicHTMLJavaScript (Maybe a)
+data DynamicHTML a = DynamicHTML HTML (DynamicHTMLJavaScript a) a
 
 -- Anything rendering both HTML and its hydrating JavaScript is a DynamicHTMLProgram
 -- ??? Define elsewhere? Not always puts code in script tag.
@@ -195,7 +205,7 @@ data DynamicHTMLProgram a = DynamicHTMLProgram
   , mount :: (forall m. JavaScript -> DOMElement -> m Unit)
   , hydrateDOM :: (forall m. JavaScript -> DOMElement -> m Unit)
   }
-runDynamicHTMLProgram :: DynamicHTMLProgram a -> a -> DynamicHTML
+runDynamicHTMLProgram :: DynamicHTMLProgram a -> a -> DynamicHTML b
 runDynamicHTMLProgram (DynamicHTMLProgram renderHTML renderJS hydrate) program =
   DynamicHTML (renderHTML program) (renderJS program) data
 ```
@@ -234,15 +244,33 @@ handleHTMLRequest req = respond html
       <> js.onload
       <> "});"
       <> "</script>"
+      -- !!! Continue thinking from here.
+      -- ??? How to get filename dynamically? Necessary for this project?
+      -- Browser-side (page) Renderer: Interpret URL requests.
+      --  - If our site and matches known route, requests its DynamicHTML and applies to DOM.
+      --  - If off-site or unknown route, directly tells browser to go there.
+      <> """<script src="/assets/BSR.js">"""
+      <> """<script src="/assets/Runtime.js">"""
+      <> "<script>"
+      <> "BSR.main();"
+      <> "runtime.main();"
+      <> "</script>"
       <> "</body></html>"
+    Runtime.main = do
+      replaceLinkClicksWithNavigates
+      handleHistoryNavRequest
+      listenForLinkHoverAndPreload
 
 handleInBrowserHTMLRequest :: HTMLRequest -> HTMLRequestHandler m
 handleInBrowserHTMLRequest req =
-  loadRoute app
+  applyDynamicHTMLToDOM $ loadURI req
   where
-    routeFromHtmlReq :: HTMLRequest -> Route
-    loadRoute :: Route -> ContT Unit _ DynamicHTML -- in-browser lazy-load this module
-    htmlGen :: DynamicHTML
+    -- ??? What is "Route"?
+    loadURI :: URI -> ContT Unit _ DynamicHTML -- in-browser lazy-load this module
+    applyDynamicHTMLToDOM :: DynamicHTML -> Eff _ Unit
+    applyDynamicHTMLToDOM (DynamicHTML h js d) = (_.init <<< unwrap <<< unsafeEval) js
+    -- Expect JavaScript to evalutate to a JS module, exposing a record of functions.
+    unsafeEval :: JavaScript -> Eff _ DynamicHTMLJavaScript
 
 -- !!! Need JS for create, not only hydrate
 mountInBrowserHTML :: DynamicHTML -> Eff _ Unit
