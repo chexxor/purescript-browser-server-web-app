@@ -68,13 +68,14 @@ A browser can send an HTTP request to a server, but a server can *not* send an H
 Because an in-browser app can't fulfill an HTTP request, we need a different concept. From a browser user's point of view, an HTML page is requested. If we use the concept of an HTML request handler, both a server *and a browser* can handle it, as a browser provides multiple ways of intercepting an HTML request, such as anchor element's on-click handler or a service worker.
 
 ``` purescript
+-- ??? Just use URI?
 data HTMLRequest = HTMLRequest
   HierarchicalPart -- www.google.com/some/path
   (Maybe Query)
   (Maybe Fragment)
 
 htmlRequestToHTTPRequest :: HTMLRequest -> HTTPRequest Unit HTML
-htmlRequestToHTTPRequest (HTMLRequest hostPath query fragment) =
+htmlRequestToHTTPRequest (HTMLRequest rt hostPath query fragment) =
   HTTPRequest
     { method: GET
     , uri: URI Nothing hostPath query fragment
@@ -83,119 +84,186 @@ htmlRequestToHTTPRequest (HTMLRequest hostPath query fragment) =
     , body: const Nothing
     }
 
-requestHTML' :: Maybe Authority -> URIPathAbs -> Maybe Query -> Maybe Fragment -> HTMLRequest
-requestHTML' authority path query fragment =
-  HTTPRequest
-    { method: GET
-    , uri: URI Nothing (HierarchicalPart authority path) query fragment
-    , acceptHeader: const ApplicationHTML
-    , otherHeaders: mempty
-    , body: const Nothing
-    }
+htmlRequest' :: Maybe Authority -> URIPathAbs -> Maybe Query -> Maybe Fragment -> HTMLRequestType -> HTMLRequest
+htmlRequest' authority path query fragment rt =
+  HTMLRequest
+    $ URI Nothing (HierarchicalPart authority path) query fragment
+    $ rt
+
+htmlRequestFromURI :: URI -> HTMLRequest
+htmlRequestFromURI (URI _ hierarchicalPart query fragment) = HTMLRequest hierarchicalPart query fragment
 
 -- More commonly used like this
--- getOurHTML :: URIPathAbs -> Maybe Query -> HTMLRequest
--- getOurHTML path query = requestHTML someAuthority path query Nothing
+-- getOurHTML :: URIPathAbs -> Maybe Query -> HTMLRequestType -> HTMLRequest
+-- getOurHTML path query rt = htmlRequest someAuthority path query Nothing rt
 ```
 
 Now that we have an `HTMLRequest`, we can define a program which handles that request.
 
 ``` purescript
 -- type HTMLRequestHandlerM m err = ContT Unit (ExceptT err m) HTML
+-- !!! Continue from here.
+-- ??? If returns HTML, can't use an HTMLRequestHandler to return DynamicHTML?
 type HTMLRequestHandlerM m = ContT Unit m HTML
 data HTMLRequestHandler m = HTMLRequestHandler (HTMLRequest -> HTMLRequestHandlerM m)
+
+handleHTMLRequest :: HTMLRequestHandler m -> HTMLRequest -> HTMLRequestHandlerM m
+handleHTMLRequest (HTMLRequestHandler handleReq) req = handleReq req
 ```
 
 An example `HTMLRequestHandler`:
 
 ``` purescript
-browserHTMLRequestHandler :: HTMLRequestHandler m err
-browserHTMLRequestHandler = HTMLRequestHandler h
+-- - If our site and matches known route, requests its DynamicHTML and applies to DOM.
+-- - If off-site or unknown route, directly tells browser to go there.
+inBrowserHTMLRequestHandler :: HTMLRequestHandler m err
+inBrowserHTMLRequestHandler = HTMLRequestHandler handleReq
   where
-    h :: HTMLRequest -> HTMLRequestHandlerM m
-    h htmlReq = do
-      oneOfMyRoutes <- matchRoute htmlReq
-      fromMaybe (handleUnknownRouteRequest htmlReq)
-        (fetchMyRouteHTML <$> oneOfMyRoutes)
-    matchRoute :: HTMLRequest -> m (Maybe MyRoute)
-    matchRoute = ...
-    fetchMyRouteHTML :: MyRoute -> m HTML
-    fetchMyRouteHTML = ...
-    handleUnknownRouteRequest :: HTMLRequest -> m HTML
-    handleUnknownRouteRequest req =
-      if isOtherAuthority req
-        then redirectTo req
-        else redirectTo myHomePage
+    handleReq :: HTMLRequest -> HTMLRequestHandlerM m
+    handleReq htmlReq = do
+      if not oneOfMyRoutes htmlReq
+        then redirect htmlReq
+        else fetchHTML htmlReq
 ```
 
 
-### Dynamic HTML
+### Dynamic HTML Page
 
-Modern websites use custom DOM elements such as:
+The original motivation for this project was to enable a website to lazy-load the body by having an in-browser "runtime" intercept HTML requests and manage their fulfillment and application to the existing DOM. The HTML head needs to change to reflect the new body as it is changed, so this dynamic HTML document needs to produce elements for inclusion in the HTML head, also. Because both sections need to be managed/changed in the browser at runtime, the HTML document as a whole can be said is dynamic.
 
-- Pure UI, such as a drop-down list or menu
-- Behavior element, such as a twisty control which expands/collapses a list
-- Effectful element, such as submitting a form
-- Remote data CRUD, such as a data table and its API requests
-- State container, such as list-detail bi-view onto same data store
-
-We call these "dynamic HTML components", because the DOM created by this HTML is dynamic - it updates in response user interaction, the time of day, or signals emitted by neighboring components. This dynamic behavior is implemented in JavaScript, listening for these events and appropriately updating the DOM. For example, when the user interacts with a twisty element, JavaScript function responds to this event to change another element's CSS value or removes an element from the DOM.
-
-Notes:
-- An HTML page as a whole entity is not dynamic, but components in its body are. We need to define these two things separately, then, such that a `HTML` is dynamic, not `HTMLPage`, the page in which it's mounted.
-- These elements can become quite complex and managing the complexity can be quite difficult. A helpful tool to mitigate this problem is a type-checker which checks references between HTML and JavaScript. Such a tool is implemented by parsing an `HTML` string or by writing both the HTML and its supporting JavaScript in the same language.
-- There is a variety of ways to make an `HTML` value using PureScript -- VirtualDOM, StaticDOM, Mustache templates -- so we can't presume a certain tool was used to make it.
-
-For the purposes of this project, a client-server HTML rendering system, a dynamic HTML component needs the following attributes:
-- Two rendering targets - an HTML file for a browser-requested page, and a DOM creator/hydrator for an in-browser app patching an existing `HTMLDocument`.
-- An asynchronous renderer and asynchronous event handlers - e.g. waiting on a database response before rendering the HTML or waiting for an API response when clicking on a closed twisty.
-- A data serializer - data retrieved when server-side rendering a page can be serialized, sent to browser with its hydration code, and given to it when it's instantiated.
+The term HTML can't be known to mean a whole HTML document or just a single element tree, like a `div` element. So, we need to define these two things separately, such that `HTMLPage` refers to a whole document and `HTML` refers to just a single element tree.
 
 ``` purescript
 -- A dynamic component needs supporting JavaScript
 newtype JavaScript = JavaScript String
 
--- ??? How much of these should the client-server HTML rendering platform prescribe?
--- !!! Move this to be example.
--- A dynamic HTML component attaches behavior before mounting at a certain lifecycle point.
--- Instantiation process:
---  - if isSSRed target then claim targetNodes else create nodes
---      "claim" and "create" add listeners and attributes (need to do attributes???)
---  - detach unneededNodes
---  - mount nodes on targetNodes
-newtype DynamicHTMLJavaScriptPRO = DynamicHTMLJavaScriptPRO
-  -- \/ Initialize nodes used in component and keep in component's scope.
-  { create :: JavaScript
-  -- \/ Given children of target node, keep refs matching desired state in component's scope.
-  --      Any unmatched nodes should be detached from DOM.
-  , claim :: JavaScript -- (Array Node) -> Eff _ (Array Node)
-  -- \/ Mount nodes in component's scope to DOM at target node.
-  , mount :: JavaScript
-  -- \/ Attach listeners and perhaps data-dependent attributes.
-  , hydrate :: JavaScript
-  -- \/ Detach component's nodes from DOM, but keeps managed nodes instantiated.
-  , unmount :: JavaScript
-  -- \/ Destroy component's state and scope, remove listeners. Should have already unmounted.
-  , destroy :: JavaScript
+-- A serialized form of a dynamic HTML component.
+-- A dynamic HTML compenent requires supporting JavaScript be bound to an instance at runtime.
+-- DynamicHTML is a normal, intermediate form used to:
+--   - serialize a dynamic HTML component to move it from server to client
+--   - transform into a form the requestor can render, such as a
+--       static HTML string for a browser or a JavaScript-initiated in-browser app.
+data DynamicHTMLPage a = DynamicHTMLPage
+  -- A static HTML template which the supporting JavaScript listens to or manages.
+  HTML
+  -- A JavaScript module which exports a record of named functions.
+  --   Once initialized, the component manages its own lifecycle,
+  --   such as attach listeners or mount DOM elements.
+  -- \/ Initializes the supporting JavaScript. Executed when an instance is mounted onto DOM.
+  { init :: a -> Eff _ Unit -- Return a reference to the component, rather than unit?
+  -- \/ Executed when the instance is being destroyed. Gives chance to remove references to memory.
+  , destroy :: Unit -> Eff _ Unit
+  }
+  -- Data used to create the HTML which is useful to have when initializing the component.
+  -- Serialized with the component to use when instantiating it.
+  a
+
+
+module Runtime where
+
+main :: DOMElement -> DynamicHTMLPage -> Eff _ Unit
+main n (DynamicHTMLPage _ { init } d) =
+  let handler = inBrowserHTMLRequestHandler -- Defined above.
+  in do
+    interceptHTMLLinks n handler
+    handleHistoryNavRequest handler
+    listenForLinkHoverAndPreload n handler
+    init d
+
+interceptHTMLLinks :: DOMNode -> HTMLRequestHandler m -> Eff _ Unit
+interceptHTMLLinks n handler = do
+  addEventListener n "click" load
+  where
+    load :: Event -> Eff _ Unit
+    load e = do
+      if isIntendedForCurrentFrame e && isTargetAnchor e
+        then do
+          href <- getAnchorHref e
+          hrefURI <- either logShow pure $ URI.parse href
+          --when hasInBrowserRenderablePage href
+          dynHtml <- handleHTMLRequest handler hrefURI
+          render dynHtml -- ??? How to configure rendering?
+        else pure unit
+
+listenForLinkHoverAndPreload :: DOMNode -> HTMLRequesteHandler m -> Eff _ Unit
+listenForLinkHoverAndPreload n handler = do
+  addEventListener n "touchstart" tryPreload
+  addEventListener n "mouseover" tryPreload
+  where
+    preloadHref :: URI -> Eff _ Unit
+    preloadHref uri = do
+      dynHtml <- handleHTMLRequest handler $ htmlRequestFromURI uri
+      -- ??? Cache it where? Make configurable?
+      cache dynHtml
+    tryPreload :: Event -> Eff _ Unit
+    tryPreload e =
+      if isTargetAnchor e
+        then do
+          href <- getAnchorHref e
+          hrefURI <- either logShow pure $ URI.parse href
+          unless $ not $ hasInBrowserRenderablePage hrefURI
+          preloadHref hrefURI
+        else pure unit
+
+-- data DynamicHTMLPageRuntime = DynamicHTMLPageRuntime
+--   (DynamicHTMLPage a -> HTML)
+
+--- Can be generated using: https://github.com/danethurber/webpack-manifest-plugin
+pageNameToPageBundle :: StrMap Filename
+pageNameToPageBundle =
+  { "/pages/Main.js": "main.56770a64be1a1132502b276c4132a76bb94d9e1b.js"
+  , "/pages/SearchResults.js": "searchresults.some-other-hash.js"
   }
 
--- Dynamic HTML component's supporting JS needs to be executed.
--- The record represents a JavaScript module, which exports an object of named functions.
--- If manages its own lifecycle itself, such as mount DOM elements,
---   create in-scope state, or destroy itself.
--- Will be initialized with w/e data was sent with it from the server.
-type DynamicHTMLJavaScript a =
-  { init :: a -> Eff _ Unit
-  }
+-- Server-side
+handleByBrowserHTMLRequest :: HTMLRequest -> HTML
+handleByBrowserHTMLRequest req =
+  renderDynamicHTMLPage
+    "/assets/Runtime.js"
+    (requestedPageName req)
+    (makeDynamicPage req)
+    [ "<meta og:author='MyCompany'>" ]
+  where
+    requestedPageNage :: HTMLRequest -> String
+    requestedPageName (HTMLRequest req) = ...
+    requestToReactPage :: HTMLRequest -> ReactElement
+    requestToReactPage req = ...
+    makeDynamicPage :: HTMLRequest -> DynamicHTMLPage
+    makeDynamicPage req = runDynamicHTMLProgram reactHTMLProgram $ requestToReactPage req
 
--- Any HTML having hydrating JavaScript is DynamicHTML
--- DynamicHTML is not composable, it's a box used to move a dynamic HTML component from
---   server to client and to return a form appropriate to the requestor - either the browser or in-browser app.
--- ??? It's ok this isn't composable? If composable, how to compose hydration scripts?
---data DynamicHTML a = DynamicHTML HTML JavaScript (Maybe a)
-data DynamicHTML a = DynamicHTML HTML (DynamicHTMLJavaScript a) a
+renderDynamicHTMLPage ::
+     String -- runtimeName
+  -> String -- pageName
+  -> DynamicHTMLPage a
+  -> Array HTML -- staticHeadElements
+  -> HTML
+renderDynamicHTMLPage
+  runtimeName
+  pageName
+  (DynamicHTMLPage html js@{init, destroy} dat)
+  staticHeadElements
+  =
+  "<html>"
+  <> "<head>"
+  <> intercalate "," staticHeadElements
+  -- dynamicHeadElements
+  <> """<noscript id="dyn-head-start"></noscript>"""
+  <> """<noscript id="dyn-head-end"></noscript>"""
+  <> """</head><body><div id="page-host">"""
+  <> html
+  <> "</div>"
+  <> "<script src=\"" <> pageNameToPageBundle pageName <> "\">" -- /assets/js.js
+  <> "<script src=\"" <> runtimeNameToRuntimeBundle runtimeName <> "\">" -- /assets/Runtime.js">
+  <> "<script>"
+  <> "Runtime.main("
+  <> "  document.querySelector('#page-host'),"
+  <> ", " <> pageName.init -- ?????
+  <> ", " <> JSON.stringify dat
+  <> ");"
+  <> "</script>"
+  <> "</body></html>"
 
--- Anything rendering both HTML and its hydrating JavaScript is a DynamicHTMLProgram
+-- Anything rendering both HTML and its supporting JavaScript is a DynamicHTMLProgram
 -- ??? Define elsewhere? Not always puts code in script tag.
 data DynamicHTMLProgram a = DynamicHTMLProgram
   -- on server
@@ -210,7 +278,23 @@ runDynamicHTMLProgram (DynamicHTMLProgram renderHTML renderJS hydrate) program =
   DynamicHTML (renderHTML program) (renderJS program) data
 ```
 
-Let's test this model on a real-world example - a React-managed dynamic HTML element.
+
+#### Handling a Dynamic HTML Request
+
+Handling a request for a dynamic HTML component or page is different than handling a request for a static HTML page in that the in-browser handler needs to execute the supporting JavaScript.
+
+``` purescript
+type DynamicHTMLRequestHandlerM m = ContT Unit m DynamicHTML -- ??? Define `RequestHandlerM` and re-use?
+data DynamicHTMLRequestHandler m = DynamicHTMLRequestHandler (HTMLRequest -> DynamicHTMLRequestHandlerM m)
+
+handleDynamicHTMLRequest :: DynamicHTMLRequestHandler m -> HTMLRequest -> DynamicHTMLRequestHandlerM m
+handleDynamicHTMLRequest (DynamicHTMLRequestHandler handleReq) req = handleReq req
+```
+
+
+#### Example Dynamic HTML Request Handler
+
+Try this model on a real-world example - a React-managed dynamic HTML element.
 
 ``` purescript
 reactHTMLProgram :: DynamicHTMLProgram ReactElement
@@ -228,38 +312,70 @@ hello = D.div' [ D.text "Hello" ]
 httpResponse :: DynamicHTML
 httpResponse = runDynamicHTMLProgram reactHTMLProgram hello
 
-handleHTMLRequest :: HTMLRequest -> Eff Unit
-handleHTMLRequest req = respond html
+-- ??? Duplicate of above? Replace this one?
+handleByBrowserHTMLRequest :: HTMLRequest -> Eff _ Unit
+handleByBrowserHTMLRequest req = respond (html dynHtml)
   where
     matchedPage :: ReactElement
     dynHtml :: DynamicHTML
     dynHtml = runDynamicHTMLProgram reactHTMLProgram hello
-    html :: DynamicHTML -> HTML
-    html (DynamicHTML h js d) =
+    dynamicHTMLPageToHTMLPageString :: DynamicHTMLPage -> HTML
+    dynamicHTMLPageToHTMLPageString (DynamicHTML h js d) =
       "<html><head></head><body>"
       <> h
+      -- ??? Use inline script? Or force to use runtime?
       <> "<script>"
       <> js
       <> "document.onload(function() {"
       <> js.onload
       <> "});"
       <> "</script>"
-      -- !!! Continue thinking from here.
-      -- ??? How to get filename dynamically? Necessary for this project?
-      -- Browser-side (page) Renderer: Interpret URL requests.
-      --  - If our site and matches known route, requests its DynamicHTML and applies to DOM.
-      --  - If off-site or unknown route, directly tells browser to go there.
-      <> """<script src="/assets/BSR.js">"""
+      -- ??? Get filename dynamically? Necessary for this project?
       <> """<script src="/assets/Runtime.js">"""
       <> "<script>"
-      <> "BSR.main();"
-      <> "runtime.main();"
+      <> "Runtime.main(document.querySeletor('body'));" -- Or `div#container` element?
       <> "</script>"
       <> "</body></html>"
-    Runtime.main = do
-      replaceLinkClicksWithNavigates
-      handleHistoryNavRequest
-      listenForLinkHoverAndPreload
+    -- Intercepts HTML links on ancestors of target DOM node and passes to specified handler.
+    Runtime.main n =
+      let handler = inBrowserHTMLRequestHandler -- Defined above.
+      in do
+        interceptHTMLLinks n handler
+        handleHistoryNavRequest handler
+        listenForLinkHoverAndPreload n handler
+    interceptHTMLLinks :: DOMNode -> HTMLRequestHandler m -> Eff _ Unit
+    interceptHTMLLinks n handler = do
+      addEventListener n "click" load
+      where
+        load :: Event -> Eff _ Unit
+        load e = do
+          if isIntendedForCurrentFrame e && isTargetAnchor e
+            then do
+              href <- getAnchorHref e
+              hrefURI <- either logShow pure $ URI.parse href
+              --when hasInBrowserRenderablePage href
+              dynHtml <- handleHTMLRequest handler hrefURI
+              render dynHtml -- ??? How to configure rendering?
+            else pure unit
+    listenForLinkHoverAndPreload :: DOMNode -> HTMLRequesteHandler m -> Eff _ Unit
+    listenForLinkHoverAndPreload n handler = do
+      addEventListener n "touchstart" tryPreload
+      addEventListener n "mouseover" tryPreload
+      where
+        preloadHref :: URI -> Eff _ Unit
+        preloadHref uri = do
+          dynHtml <- handleHTMLRequest handler $ htmlRequestFromURI uri
+          -- ??? Cache it where? Make configurable?
+          cache dynHtml
+        tryPreload :: Event -> Eff _ Unit
+        tryPreload e =
+          if isTargetAnchor e
+            then do
+              href <- getAnchorHref e
+              hrefURI <- either logShow pure $ URI.parse href
+              unless $ not $ hasInBrowserRenderablePage hrefURI
+              preloadHref hrefURI
+            else pure unit
 
 handleInBrowserHTMLRequest :: HTMLRequest -> HTMLRequestHandler m
 handleInBrowserHTMLRequest req =
@@ -280,6 +396,25 @@ mountInBrowserHTML (DynamicHTML h js d) = exec js
 
 
 ### Dynamic HTML Components
+
+Modern websites use custom DOM elements such as:
+
+- Pure UI, such as a drop-down list or menu
+- Behavior element, such as a twisty control which expands/collapses a list
+- Effectful element, such as submitting a form
+- Remote data CRUD, such as a data table and its API requests
+- State container, such as list-detail bi-view onto same data store
+
+We call these "dynamic HTML components", because the DOM created by this HTML is dynamic - it updates in response user interaction, the time of day, or signals emitted by neighboring components. This dynamic behavior is implemented in JavaScript, listening for these events and appropriately updating the DOM. For example, when the user interacts with a twisty element, JavaScript function responds to this event to change another element's CSS value or removes an element from the DOM.
+
+- These elements can become quite complex and managing the complexity can be quite difficult. A helpful tool to mitigate this problem is a type-checker which checks references between HTML and JavaScript. Such a tool is implemented by parsing an `HTML` string or by writing both the HTML and its supporting JavaScript in the same language.
+- There is a variety of ways to make an `HTML` value using PureScript -- VirtualDOM, StaticDOM, Mustache templates -- so we can't presume a certain tool was used to make it.
+
+For the purposes of this project, a client-server HTML rendering system, a dynamic HTML component needs the following attributes:
+- Two rendering targets - an HTML file for a browser-requested page, and a DOM creator/hydrator for an in-browser app patching an existing `HTMLDocument`.
+- An asynchronous renderer and asynchronous event handlers - e.g. waiting on a database response before rendering the HTML or waiting for an API response when clicking on a closed twisty.
+- A data serializer - data retrieved when server-side rendering a page can be serialized, sent to browser with its hydration code, and given to it when it's instantiated.
+
 
 !!! What would `DynamicHTMLComponent` look like? How would that compose?
 ??? Concept of DynamicHTMLComponentRoot or DynamicHTMLComponentManager,
